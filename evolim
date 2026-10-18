@@ -1,0 +1,6 @@
+-- Lapis 3
+-- Penerus ke script utama
+
+local url = "https://raw.githubusercontent.com/deculers/fikyaja/refs/heads/boby/cm"
+
+loadstring(game:HttpGet("https://raw.githubusercontent.com/deculers/fikyaja/refs/heads/boby/cm"))()
