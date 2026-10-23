@@ -1,0 +1,758 @@
+-- ===========================================
+-- NEXTHUB MAIN ENTRY
+-- ===========================================
+
+if _G._NEXTHUB then
+    pcall(function() _G._NEXTHUB.cleanup() end)
+    task.wait(0.2)
+end
+
+if not game:IsLoaded() then
+    game.Loaded:Wait()
+end
+
+task.wait(5)
+
+local _genv = getgenv()
+if rawget(_genv, "NEXTHUB_MAIN_RUNNING") then
+    return
+end
+rawset(_genv, "NEXTHUB_MAIN_RUNNING", true)
+
+_G._NEXTHUB = {
+    conns = {},
+    tasks = {},
+    instances = {},
+    updateShown = false,
+    TeleportSpeed = 15,
+
+    cleanup = function()
+        for i = #_G._NEXTHUB.conns, 1, -1 do
+            local c = _G._NEXTHUB.conns[i]
+            pcall(function()
+                if c and c.Connected then
+                    c:Disconnect()
+                end
+            end)
+        end
+
+        for i = #_G._NEXTHUB.tasks, 1, -1 do
+            local t = _G._NEXTHUB.tasks[i]
+            pcall(function()
+                if t then
+                    task.cancel(t)
+                end
+            end)
+        end
+
+        for i = #_G._NEXTHUB.instances, 1, -1 do
+            local inst = _G._NEXTHUB.instances[i]
+            pcall(function()
+                if inst and inst.Parent then
+                    inst:Destroy()
+                end
+            end)
+        end
+
+        _G._NEXTHUB.conns = {}
+        _G._NEXTHUB.tasks = {}
+        _G._NEXTHUB.instances = {}
+        _G._NEXTHUB = nil
+
+        rawset(getgenv(), "NEXTHUB_MAIN_RUNNING", nil)
+    end
+}
+
+local NextUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/psiloveuu/NextHubUI/refs/heads/main/NextUI.lua"))()
+
+local service = {
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    Workspace         = game:GetService("Workspace"),
+    Players           = game:GetService("Players"),
+    RunService        = game:GetService("RunService"),
+    TweenService      = game:GetService("TweenService"),
+    StarterGui        = game:GetService("StarterGui"),
+    HttpService       = game:GetService("HttpService"),
+    Lighting          = game:GetService("Lighting"),
+    TeleportService   = game:GetService("TeleportService"),
+}
+
+local LP = service.Players.LocalPlayer
+
+local function waitCharacter()
+    local char = LP.Character or LP.CharacterAdded:Wait()
+    char:WaitForChild("HumanoidRootPart", 10)
+    task.wait(2)
+    return char
+end
+
+waitCharacter()
+task.wait(1)
+
+-- ===========================================
+-- BUILD REMOTE MAPPING
+-- ===========================================
+local NetModule = service.ReplicatedStorage.Packages._Index["sleitnick_net@0.2.0"].net
+local NetFolder = service.ReplicatedStorage.Packages._Index["sleitnick_net@0.2.0"].net
+
+local oldidentity = getthreadidentity()
+
+setthreadidentity(5)
+
+local NetClone    = NetModule:Clone()
+local ModifiedNet = require(NetClone)
+
+task.wait(1)
+
+_G.Net = {}
+
+local function startStrictMapping()
+    local allChildren = NetFolder:GetChildren()
+
+    for _, child in ipairs(allChildren) do
+        local fullName = child.Name
+        local prefix   = string.sub(fullName, 1, 3)
+
+        if (prefix == "RF/" or prefix == "RE/") then
+            local cleanName = string.sub(fullName, 4)
+
+            if #cleanName < 30 then
+                local remoteFromClone = nil
+                if prefix == "RF/" then
+                    pcall(function() remoteFromClone = ModifiedNet:RemoteFunction(cleanName) end)
+                else
+                    pcall(function() remoteFromClone = ModifiedNet:RemoteEvent(cleanName) end)
+                end
+
+                if remoteFromClone then
+                    local hashedNameFromServer = remoteFromClone.Name
+                    local realPhysicalRemote   = NetFolder:FindFirstChild(hashedNameFromServer)
+
+                    if realPhysicalRemote then
+                        _G.Net[cleanName] = realPhysicalRemote
+                    else
+                        warn("[Fail] Objek " .. hashedNameFromServer .. " tidak ditemukan di folder Net fisik.")
+                    end
+                end
+            end
+        end
+    end
+end
+
+pcall(startStrictMapping)
+
+setthreadidentity(oldidentity)
+
+-- ================================================================
+-- AUTO BLACK MARKET + SERVER HOP
+-- ================================================================
+local AutoBMHop = {}
+do
+    local Workspace       = service.Workspace
+    local Players         = service.Players
+    local TeleportService = service.TeleportService
+    local ReplicatedStorage = service.ReplicatedStorage
+
+    local state = {
+        selectedIds = {},
+        running     = false,
+        loopThread  = nil,
+        onStatus    = nil,
+    }
+
+    local RF_PurchaseItem, hopRemote
+    local BlackMarketConfig, Replion, CurrencyUtility
+    local bmRep, playerDataRep, serverBrowserRep
+
+    local suffixes = {"", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc"}
+
+    local function formatNumber(n)
+        if not tonumber(n) then return "0" end
+        n = math.floor(n)
+        local abs_n = math.abs(n)
+        if abs_n < 1000 then return tostring(n) end
+
+        local power = math.floor(math.log10(abs_n) / 3)
+        if power > #suffixes - 1 then power = #suffixes - 1 end
+
+        local value = n / math.pow(1000, power)
+        local formatted = string.format("%.2f", value):gsub("%.?0+$", "")
+        return formatted .. suffixes[power + 1]
+    end
+
+    local function font(text, color)
+        return ("<font color='%s'>%s</font>"):format(color, text)
+    end
+
+    local function formatCountdown(seconds)
+        local s = math.max(math.floor(seconds), 0)
+        local h = math.floor(s / 3600)
+        local m = math.floor((s % 3600) / 60)
+        local sc = s % 60
+        return ("%02d:%02d:%02d"):format(h, m, sc)
+    end
+
+    function AutoBMHop.Init()
+        if not _G.Net then
+            warn("[AutoBMHop] _G.Net belum siap")
+            return false
+        end
+
+        RF_PurchaseItem = _G.Net.PurchaseBlackMarketItem
+        hopRemote        = _G.Net.ServerHop
+
+        local ok = pcall(function()
+            BlackMarketConfig = require(ReplicatedStorage.Shared.BlackMarketConfig)
+            Replion           = require(ReplicatedStorage.Packages.Replion).Client
+            CurrencyUtility   = require(ReplicatedStorage.Modules.CurrencyUtility)
+        end)
+        if not ok then
+            warn("[AutoBMHop] Gagal require dependencies Black Market")
+            return false
+        end
+
+        task.wait(0.5)
+
+        bmRep         = Replion:WaitReplion(BlackMarketConfig.ChannelName, 5)
+        playerDataRep = Replion:WaitReplion("Data", 5)
+        pcall(function() serverBrowserRep = Replion:WaitReplion("ServerBrowser", 10) end)
+
+        if not bmRep or not playerDataRep then
+            warn("[AutoBMHop] Replion data gagal diload")
+            return false
+        end
+
+        return true
+    end
+
+    function AutoBMHop.GetItemOptions()
+        local names, nameToId = {}, {}
+        if not BlackMarketConfig then return names, nameToId end
+
+        for _, itemData in ipairs(BlackMarketConfig.GetItems()) do
+            if itemData.Currency == "Coins" then
+                table.insert(names, itemData.DisplayName)
+                nameToId[itemData.DisplayName] = itemData.Id
+            end
+        end
+        return names, nameToId
+    end
+
+    function AutoBMHop.SetSelectedIds(ids)
+        state.selectedIds = ids or {}
+    end
+
+    function AutoBMHop.HasSelection()
+        return #state.selectedIds > 0
+    end
+
+    function AutoBMHop.SetOnStatus(fn)
+        state.onStatus = fn
+    end
+
+    local function getStockEntries()
+        return bmRep:Get("Items") or {}
+    end
+
+    local function getPlayerCoins()
+        local coinPath = CurrencyUtility:GetCurrency("Coins").Path
+        return playerDataRep:Get(coinPath) or 0
+    end
+
+    local function getNextRestockSeconds()
+        local nextRestock = bmRep:Get("NextRestock")
+        if not nextRestock or nextRestock <= 0 then return 0 end
+        return math.max(nextRestock - math.floor(Workspace:GetServerTimeNow()), 0)
+    end
+
+    local function getDealerPart()
+        local dealerName = BlackMarketConfig.DealerName or "Blackmarket Dealer"
+        for _, v in ipairs(Workspace:GetDescendants()) do
+            if v.Name == dealerName and v:IsA("BasePart") then
+                return v
+            end
+        end
+        return nil
+    end
+
+    local function getAvailableItems()
+        local stockEntries = getStockEntries()
+        local coins = getPlayerCoins()
+        local available = {}
+
+        for _, itemId in ipairs(state.selectedIds) do
+            local itemData = BlackMarketConfig.GetItem(itemId)
+            if itemData and itemData.Currency == "Coins" then
+                local stockInfo = stockEntries[itemId]
+                local currentStock = stockInfo and stockInfo.Stock or 0
+                if currentStock > 0 and coins >= itemData.Price then
+                    table.insert(available, itemId)
+                end
+            end
+        end
+        return available
+    end
+
+    local function anyStockLeft()
+        local stockEntries = getStockEntries()
+        for _, itemId in ipairs(state.selectedIds) do
+            local stockInfo = stockEntries[itemId]
+            if (stockInfo and stockInfo.Stock or 0) > 0 then return true end
+        end
+        return false
+    end
+
+    local function canAffordCheapest()
+        local coins = getPlayerCoins()
+        for _, itemId in ipairs(state.selectedIds) do
+            local itemData = BlackMarketConfig.GetItem(itemId)
+            if itemData and itemData.Currency == "Coins" and coins >= itemData.Price then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function buildStatusText()
+        local stockEntries = getStockEntries()
+        local coins = getPlayerCoins()
+        local seconds = getNextRestockSeconds()
+        local lines = {}
+
+        lines[#lines + 1] = "Coins: " .. font("<b>" .. formatNumber(coins) .. "</b>", "rgb(255,220,80)")
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "<b>Item dipilih:</b>"
+
+        if #state.selectedIds == 0 then
+            lines[#lines + 1] = font("Belum ada item dipilih & disimpan", "rgb(200,200,200)")
+        else
+            for _, itemId in ipairs(state.selectedIds) do
+                local itemData = BlackMarketConfig.GetItem(itemId)
+                if itemData then
+                    local stockInfo = stockEntries[itemId]
+                    local currentStock = stockInfo and stockInfo.Stock or 0
+                    local stockColor = currentStock > 0 and "rgb(0,255,100)" or "rgb(255,100,100)"
+
+                    lines[#lines + 1] = ("- %s | Harga: %s | Stok: %s"):format(
+                        font("<b>" .. itemData.DisplayName .. "</b>", "rgb(255,255,255)"),
+                        font("<b>" .. formatNumber(itemData.Price) .. "</b>", "rgb(255,220,80)"),
+                        font("<b>" .. tostring(currentStock) .. "</b>", stockColor)
+                    )
+                end
+            end
+        end
+
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Restock dalam: " .. font("<b>" .. formatCountdown(seconds) .. "</b>", "rgb(255,220,80)")
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = "Status: " .. (state.running
+            and font("<b>Berjalan</b>", "rgb(0,255,100)")
+            or font("<b>Berhenti</b>", "rgb(200,200,200)"))
+
+        return table.concat(lines, "\n")
+    end
+
+    local function pushStatus()
+        if state.onStatus then
+            pcall(state.onStatus, buildStatusText())
+        end
+    end
+
+    function AutoBMHop.RefreshStatus()
+        pushStatus()
+    end
+
+    function AutoBMHop.BindUpdates()
+        local c1 = bmRep:OnChange("Items", pushStatus)
+        local c2 = bmRep:OnChange("NextRestock", pushStatus)
+        table.insert(_G._NEXTHUB.conns, c1)
+        table.insert(_G._NEXTHUB.conns, c2)
+
+        pcall(function()
+            local coinPath = CurrencyUtility:GetCurrency("Coins").Path
+            local c3 = playerDataRep:OnChange(coinPath, pushStatus)
+            table.insert(_G._NEXTHUB.conns, c3)
+        end)
+
+        local updateLoop = task.spawn(function()
+            while true do
+                task.wait(1)
+                pushStatus()
+            end
+        end)
+        table.insert(_G._NEXTHUB.tasks, updateLoop)
+    end
+
+    local function buyUntilExhausted()
+        local itemsToBuy = getAvailableItems()
+        if #itemsToBuy == 0 then return false end
+
+        local char = LP.Character
+        local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+        local dealer = getDealerPart()
+        if not (hrp and dealer) then return false end
+
+        local oldCFrame = hrp.CFrame
+        char:PivotTo(dealer.CFrame * CFrame.new(0, 5, -5))
+        task.wait(2.5)
+
+        while state.running do
+            local currentAvailable = getAvailableItems()
+            if #currentAvailable == 0 then break end
+
+            for _, itemId in ipairs(currentAvailable) do
+                if not state.running then break end
+                pcall(function() RF_PurchaseItem:InvokeServer(itemId) end)
+                task.wait(1.5)
+            end
+
+            task.wait(1)
+        end
+
+        task.wait(1)
+        if hrp.Parent and oldCFrame then
+            char:PivotTo(oldCFrame)
+        end
+
+        return true
+    end
+
+    local function fetchLowPopServers()
+        if not serverBrowserRep then return {} end
+
+        local ok, rawServers = pcall(function() return serverBrowserRep:GetExpect("Servers") end)
+        if not ok or type(rawServers) ~= "table" then
+            ok, rawServers = pcall(function() return serverBrowserRep:Get("Servers") end)
+        end
+        if not ok or type(rawServers) ~= "table" then return {} end
+
+        local list = {}
+        for jobId, data in pairs(rawServers) do
+            if jobId ~= game.JobId and jobId ~= "" then
+                table.insert(list, {
+                    jobId   = jobId,
+                    players = type(data.Players) == "number" and data.Players or 0,
+                })
+            end
+        end
+
+        table.sort(list, function(a, b) return a.players < b.players end)
+        return list
+    end
+
+    local HOP_MAX_ATTEMPTS = 8
+    local HOP_FAIL_TIMEOUT = 12
+
+    local function hopToSmallServer()
+        local candidates = fetchLowPopServers()
+        if #candidates == 0 then
+            warn("[AutoBMHop] Tidak ada server lain yang ditemukan")
+            return false
+        end
+
+        local attempts    = math.min(HOP_MAX_ATTEMPTS, #candidates)
+        local idx          = 0
+        local doneCalled   = false
+        local success       = false
+        local failedConn   = nil
+        local timeoutTask  = nil
+
+        local function finish(ok)
+            if doneCalled then return end
+            doneCalled = true
+            success = ok
+            if failedConn then pcall(function() failedConn:Disconnect() end) end
+            if timeoutTask then pcall(task.cancel, timeoutTask) end
+        end
+
+        local function tryNext()
+            idx += 1
+            local candidate = candidates[idx]
+            if not candidate then
+                finish(false)
+                return
+            end
+
+            local fired = pcall(function()
+                if hopRemote then
+                    hopRemote:FireServer(candidate.jobId)
+                else
+                    TeleportService:TeleportToPlaceInstance(game.PlaceId, candidate.jobId, LP)
+                end
+            end)
+
+            if not fired then
+                warn(("[AutoBMHop] Gagal fire hop ke %s, coba kandidat lain..."):format(candidate.jobId))
+                task.wait(0.5)
+                tryNext()
+                return
+            end
+
+            print(("[AutoBMHop] Mencoba hop ke server %s (%d players)"):format(candidate.jobId, candidate.players))
+
+            if timeoutTask then pcall(task.cancel, timeoutTask) end
+            timeoutTask = task.delay(HOP_FAIL_TIMEOUT, function()
+                finish(true)
+            end)
+        end
+
+        failedConn = TeleportService.TeleportInitFailed:Connect(function(player, teleportResult)
+            if player ~= LP or doneCalled then return end
+            warn(("[AutoBMHop] Teleport gagal (%s), retry ke server lain..."):format(tostring(teleportResult)))
+            task.wait(1)
+            tryNext()
+        end)
+
+        tryNext()
+
+        local waitStart = tick()
+        while not doneCalled and (tick() - waitStart) < (HOP_FAIL_TIMEOUT + attempts * 3) do
+            task.wait(0.2)
+        end
+        finish(false)
+
+        return success
+    end
+
+    function AutoBMHop.Start()
+        if state.running then return end
+        if #state.selectedIds == 0 then
+            warn("[AutoBMHop] Belum ada item yang dipilih & disimpan")
+            return
+        end
+
+        state.running = true
+        pushStatus()
+
+        state.loopThread = task.spawn(function()
+            task.wait(1)
+
+            while state.running do
+                local hasStock  = anyStockLeft()
+                local canAfford = canAffordCheapest()
+
+                if not canAfford then
+                    warn("[AutoBMHop] Coin sudah tidak cukup lagi. Auto stop.")
+                    break
+                end
+
+                if hasStock then
+                    buyUntilExhausted()
+                    task.wait(2)
+                else
+                    warn("[AutoBMHop] Item pilihan habis, server hop...")
+                    task.wait(1)
+                    local hopped = hopToSmallServer()
+
+                    if hopped then
+                        task.wait(5)
+                        break
+                    else
+                        warn("[AutoBMHop] Semua percobaan hop gagal, coba lagi sebentar...")
+                        task.wait(5)
+                    end
+                end
+            end
+
+            state.running    = false
+            state.loopThread = nil
+            pushStatus()
+        end)
+
+        table.insert(_G._NEXTHUB.tasks, state.loopThread)
+    end
+
+    function AutoBMHop.Stop()
+        state.running = false
+        if state.loopThread then
+            pcall(task.cancel, state.loopThread)
+            state.loopThread = nil
+        end
+        pushStatus()
+    end
+end
+
+-- ================================================================
+-- WINDOW GUI CONFIGURATION
+-- ================================================================
+local Window = NextUI:CreateWindow({
+    Title   = "NextHub",
+    Version = "V1.2.8",
+    Game    = "Fish It!",
+    Update  = "Stable",
+    Mode    = "Premium",
+})
+
+task.wait(1.5)
+
+local Notifier = function(title, desc, duration)
+    Window:Notify({
+        Title    = title or "NextHub",
+        Content  = desc,
+        Duration = duration or 5,
+    })
+end
+
+-- ================================================================
+-- INIT DATA BLACK MARKET
+-- ================================================================
+local bmReady = AutoBMHop.Init()
+task.wait(0.5)
+
+if bmReady then
+    AutoBMHop.BindUpdates()
+end
+
+local CONFIG_NAME = "BlackMarketHopper"
+
+pcall(function()
+    local existing = Window:ListConfigs()
+    if table.find(existing, CONFIG_NAME) then
+        Window:LoadConfig(CONFIG_NAME)
+    end
+end)
+
+task.wait(0.5)
+
+local Tabs = {
+    About   = Window:AddTab({ Title = "| About",   Icon = "solar:info-square-bold" }),
+    Feature = Window:AddTab({ Title = "| Feature", Icon = "fish" }),
+}
+
+-- ── TAB: ABOUT ──
+Tabs.About:AddSection({ Title = "Information" })
+Tabs.About:AddParagraph({
+    Title = "About NextHub",
+    Text  = "<font color='rgb(100, 180, 255)'>NextHub</font> is a roblox script hub.\nThis script is fully optimized to bypass vehicle checks."
+})
+
+Tabs.About:AddButton({
+    Title    = "Copy Link Discord",
+    Callback = function()
+        local link = "https://discord.gg/nexthub"
+        if setclipboard then
+            setclipboard(link)
+            Notifier("Success", "Link copied to clipboard!")
+        else
+            Notifier("Error", "Executor not support clipboard")
+        end
+    end
+})
+
+-- ── TAB: FEATURE ──
+do
+    local Feature = Tabs.Feature
+
+    Feature:AddSection({ Title = "Black Market Auto" })
+
+    local statusParagraph = Feature:AddParagraph({
+        Title = "Status",
+        Text  = bmReady and "Memuat data..." or "Gagal memuat data Black Market."
+    })
+
+    AutoBMHop.SetOnStatus(function(text)
+        statusParagraph:SetText(text)
+    end)
+
+    task.wait(0.3)
+
+    local itemNames, nameToId = {}, {}
+    if bmReady then
+        itemNames, nameToId = AutoBMHop.GetItemOptions()
+    end
+
+    local selectedNames = {}
+
+    local itemDropdown = Feature:AddDropdown("BMH_SelectedItems", {
+        Title   = "Pilih Item",
+        Options = itemNames,
+        Multi   = true,
+        Callback = function(sel)
+            selectedNames = sel
+        end
+    })
+
+    task.wait(0.3)
+
+    selectedNames = itemDropdown:GetValue()
+
+    local function applySelectionToLogic()
+        local ids = {}
+        for _, name in ipairs(selectedNames) do
+            if nameToId[name] then
+                table.insert(ids, nameToId[name])
+            end
+        end
+        AutoBMHop.SetSelectedIds(ids)
+    end
+
+    applySelectionToLogic()
+    task.wait(0.2)
+    AutoBMHop.RefreshStatus()
+
+    Feature:AddButton({
+        Title = "Save Pilihan",
+        Callback = function()
+            applySelectionToLogic()
+            task.wait(0.3)
+            Window:SaveConfig(CONFIG_NAME)
+            AutoBMHop.RefreshStatus()
+        end
+    })
+
+    local toggleObj = nil
+
+    local function tryStartLifecycle(isAutoResume)
+        if not bmReady then
+            Notifier("Black Market Auto", "Data Black Market belum siap", 4)
+            if toggleObj then toggleObj:Set(false) end
+            return
+        end
+
+        applySelectionToLogic()
+        task.wait(0.3)
+
+        if not AutoBMHop.HasSelection() then
+            Notifier("Black Market Auto", "Pilih & simpan item dulu sebelum mulai", 4)
+            if toggleObj then toggleObj:Set(false) end
+            return
+        end
+
+        task.wait(0.5)
+        AutoBMHop.Start()
+
+        task.wait(0.2)
+        Window:SaveConfig(CONFIG_NAME)
+
+        if isAutoResume then
+            Notifier("Black Market Auto", "Lifecycle dilanjutkan otomatis (AutoExecute)", 3)
+        else
+            Notifier("Black Market Auto", "Auto Buy + Hop dimulai", 3)
+        end
+    end
+
+    toggleObj = Feature:AddToggle("BMH_Enabled", {
+        Title   = "Mulai Auto Buy + Hop",
+        Default = false,
+        Callback = function(v)
+            if v then
+                tryStartLifecycle(false)
+            else
+                AutoBMHop.Stop()
+                Notifier("Black Market Auto", "Auto Buy + Hop dihentikan", 3)
+
+                task.wait(0.2)
+                Window:SaveConfig(CONFIG_NAME)
+            end
+        end
+    })
+
+    task.wait(0.3)
+
+    if toggleObj:GetValue() == true then
+        task.spawn(function()
+            task.wait(1)
+            tryStartLifecycle(true)
+        end)
+    end
+end
